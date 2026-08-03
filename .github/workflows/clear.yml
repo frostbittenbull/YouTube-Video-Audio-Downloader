@@ -1,0 +1,43 @@
+name: Squash and Cleanup
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Squash all commits into one
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          COMMIT_MSG="Update: $(date +'%Y-%m-%d')"
+          git checkout --orphan temp-branch
+          git add -A
+          git commit -m "$COMMIT_MSG"
+          git branch -D "$BRANCH"
+          git branch -m "$BRANCH"
+          git push --force origin "$BRANCH"
+
+      - name: Cleanup Actions History
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_RUN_ID=${{ github.run_id }}
+          RUNS=$(gh run list --workflow "${{ github.workflow }}" --status completed --limit 100 --json databaseId --jq ".[] | select(.databaseId != $CURRENT_RUN_ID) | .databaseId")
+          if [ -n "$RUNS" ]; then
+            for RUN_ID in $RUNS; do
+              gh run delete "$RUN_ID"
+            done
+          fi
