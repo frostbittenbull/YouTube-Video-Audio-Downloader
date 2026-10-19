@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube — Video & Audio Downloader
 // @namespace    http://tampermonkey.net/
-// @version      1.0.3
+// @version      1.0.4
 // @description  Добавляет полноценное скачивание видео и аудио на YouTube: достаёт прямые ссылки на медиапоток через несколько клиентов внутреннего API, а если это не удаётся — честно помечает дорожку недоступной (SABR-фолбэк отключён как ненадёжный). Ремукс видео+аудио прямо в браузере через Mediabunny/WebCodecs — без ffmpeg и без бэкенда.
 // @author       frostbittenbull
 // @icon         https://www.youtube.com/s/desktop/cd0ebe65/img/favicon_32x32.png
@@ -267,17 +267,22 @@
     }
 
     async function withSabrRetry(label, fn, controller) {
-      try {
-        return await fn();
-      } catch (e) {
-        if (e && e.cancelled) throw e;
-        console.warn(`[ytdl][sabr] ${label}: попытка 1 не удалась (${e && e.message}), повтор с новым конфигом…`);
-        abortActiveSabr();
-        if (controller) controller.throwIfCancelled();
-        await new Promise((r) => setTimeout(r, 1500));
-        return await fn();
-      }
+  try {
+    return await fn();
+  } catch (e) {
+    if (e && e.cancelled) throw e;
+    if (controller) {
+      controller.throwIfCancelled();
+      if (controller.paused) await controller.waitIfPaused();
+      controller.throwIfCancelled();
     }
+    console.warn(`[ytdl][sabr] ${label}: попытка 1 не удалась (${e && e.message}), повтор с новым конфигом…`);
+    abortActiveSabr();
+    if (controller) controller.throwIfCancelled();
+    await new Promise((r) => setTimeout(r, 1500));
+    return await fn();
+  }
+}
     const VideoPlaybackAbrRequest = GV.Protos.VideoPlaybackAbrRequest;
 
     let tvHtml5Formats = [];
@@ -393,18 +398,24 @@
             if (onChunkProgress && typeof res.loaded === 'number') onChunkProgress(res.loaded);
           },
           onload: (res) => {
-            cleanup();
-            if (res.status === 200 || res.status === 206) {
-              resolve(res);
-              return;
-            }
-            let bodyPreview = '';
-            try {
-              const bytes = new Uint8Array(res.response || new ArrayBuffer(0));
-              bodyPreview = new TextDecoder('utf-8', { fatal: false }).decode(bytes.slice(0, 500));
-            } catch (e) {}
-            console.error(`[ytdl][diag] HTTP ${res.status} на диапазон ${start}-${end}, тело ответа:`, bodyPreview || '(пусто)');
-            reject(new Error(`HTTP ${res.status} при скачивании чанка${bodyPreview ? ' — ' + bodyPreview.slice(0, 200) : ''}`));
+              cleanup();
+              if (res.status === 200 || res.status === 206) {
+                  resolve(res);
+                  return;
+              }
+              if (res.status === 416) {
+                  // Range Not Satisfiable — запросили за пределами файла; отдаём пустой ответ,
+                  // вызывающий код сам решит, что это финиш (см. проверку response.byteLength === 0)
+                  resolve(Object.assign({}, res, { response: new ArrayBuffer(0) }));
+                  return;
+              }
+              let bodyPreview = '';
+              try {
+                  const bytes = new Uint8Array(res.response || new ArrayBuffer(0));
+                  bodyPreview = new TextDecoder('utf-8', { fatal: false }).decode(bytes.slice(0, 500));
+              } catch (e) {}
+              console.error(`[ytdl][diag] HTTP ${res.status} на диапазон ${start}-${end}, тело ответа:`, bodyPreview || '(пусто)');
+              reject(new Error(`HTTP ${res.status} при скачивании чанка${bodyPreview ? ' — ' + bodyPreview.slice(0, 200) : ''}`));
           },
           onerror: (err) => {
             cleanup();
@@ -590,9 +601,9 @@
     }
 
     function getUstreamerConfigFromPlayerResponse(pr) {
-      try {
-        return pr.playerConfig.mediaCommonConfig.mediaUstreamerRequestConfig.videoPlaybackUstreamerConfig || null;
-      } catch (e) { return null; }
+        try {
+            return pr?.playerConfig?.mediaCommonConfig?.mediaUstreamerRequestConfig?.videoPlaybackUstreamerConfig || null;
+        } catch (e) { return null; }
     }
 
     function buildSabrFormats(pr) {
@@ -1002,55 +1013,85 @@
     }
 
     const STALL_MS = 25000;
+    // Ожидание одного чанка из reader с детекцией «зависания», не считая время паузы
+async function awaitReadWithPause(reader, controller, tag, received, stallMs) {
+  const readPromise = reader.read();
+  readPromise.catch(() => {});
+  let timer = null;
+  let baseline = Date.now();
+  let pauseStart = null;
+
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (controller && controller.cancelled) {
+        if (timer) clearTimeout(timer);
+        reject(controller.makeCancelError());
+        return;
+      }
+      if (controller && controller.paused) {
+        if (!pauseStart) pauseStart = Date.now();
+        timer = setTimeout(check, 500);
+        return;
+      }
+      if (pauseStart) {
+        baseline += Date.now() - pauseStart;
+        pauseStart = null;
+      }
+      if (Date.now() - baseline > stallMs) {
+        if (timer) clearTimeout(timer);
+        reject(new Error(`${tag}нет данных >${stallMs / 1000}с на ${received} байт — поток завис (см. консоль: fetch'и выше)`));
+        return;
+      }
+      timer = setTimeout(check, 500);
+    };
+    timer = setTimeout(check, 500);
+
+    readPromise.then(
+      (v) => { if (timer) clearTimeout(timer); resolve(v); },
+      (e) => { if (timer) clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
     async function readStreamToBuffer(readableStream, onProgress, approxTotal, label, controller) {
-      const tag = label ? `[${label}] ` : '';
-      const reader = readableStream.getReader();
-      if (controller) controller.registerAbort(() => { try { reader.cancel(); } catch (e) {} });
-      const chunks = [];
-      let received = 0;
-      let lastLogged = 0;
-      while (true) {
-        if (controller) {
-          await controller.waitIfPaused();
-          if (controller.cancelled) { try { await reader.cancel(); } catch (e) {} throw controller.makeCancelError(); }
-        }
-
-        let timer;
-        const readPromise = reader.read();
-        readPromise.catch(() => {});
-        const timeoutPromise = new Promise((_, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error(`${tag}нет данных >${STALL_MS / 1000}с на ${received} байт — поток завис (см. консоль: fetch'и выше)`));
-          }, STALL_MS);
-        });
-
-        let result;
-        try {
-          result = await Promise.race([readPromise, timeoutPromise]);
-        } finally {
-          clearTimeout(timer);
-        }
-
-        const { done, value } = result;
-        if (done) {
-          console.log(`[ytdl][diag] ${tag}стрим завершён нормально, всего байт:`, received);
-          break;
-        }
-        chunks.push(value);
-        received += value.byteLength;
-        if (received - lastLogged >= 1048576) {
-          lastLogged = received;
-          console.log(`[ytdl][diag] ${tag}получено ${received} байт`, new Date().toISOString());
-        }
-        if (onProgress) onProgress(received, approxTotal);
-      }
-      const out = new Uint8Array(received);
-      let offset = 0;
-      for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
-      if (onProgress) onProgress(received, approxTotal || received);
-      return out.buffer;
+  const tag = label ? `[${label}] ` : '';
+  const reader = readableStream.getReader();
+  if (controller) {
+    controller.registerAbort(() => {
+      // На паузу не реагируем — только на отмену, иначе убиваем SABR-стрим
+      if (!controller.cancelled) return;
+      try { reader.cancel(); } catch (e) {}
+    });
+  }
+  const chunks = [];
+  let received = 0;
+  let lastLogged = 0;
+  while (true) {
+    if (controller) {
+      await controller.waitIfPaused();
+      if (controller.cancelled) { try { await reader.cancel(); } catch (e) {} throw controller.makeCancelError(); }
     }
+
+    const result = await awaitReadWithPause(reader, controller, tag, received, STALL_MS);
+    const { done, value } = result;
+    if (done) {
+      console.log(`[ytdl][diag] ${tag}стрим завершён нормально, всего байт:`, received);
+      break;
+    }
+    chunks.push(value);
+    received += value.byteLength;
+    if (received - lastLogged >= 1048576) {
+      lastLogged = received;
+      console.log(`[ytdl][diag] ${tag}получено ${received} байт`, new Date().toISOString());
+    }
+    if (onProgress) onProgress(received, approxTotal);
+  }
+  const out = new Uint8Array(received);
+  let offset = 0;
+  for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
+  if (onProgress) onProgress(received, approxTotal || received);
+  return out.buffer;
+}
 
     function makeThrottledFetch(minIntervalMs, label) {
       const tag = label ? `(${label}) ` : '';
@@ -1077,39 +1118,65 @@
     }
 
     async function muxVideoAudio(videoBuf, videoMime, audioBuf, audioMime, onProgress) {
-      const outputFormat = new Mp4OutputFormat();
-      const ext = 'mp4';
+  const videoCodec = codecOf(videoMime);
+  const audioCodec = codecOf(audioMime);
 
-      const videoBlob = new Blob([videoBuf]);
-      const audioBlob = new Blob([audioBuf]);
+  const isAvc = videoCodec === 'avc1' || videoCodec === 'avc3';
+  const isVp = videoCodec === 'vp8' || videoCodec === 'vp9' || videoCodec === 'vp09';
+  const isAv1 = videoCodec === 'av01';
+  const isAac = audioCodec === 'mp4a';
+  const isOpus = audioCodec === 'opus';
+  const isVorbis = audioCodec === 'vorbis';
 
-      const videoInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(videoBlob) });
-      const audioInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(audioBlob) });
+  let outputFormat, ext;
+  if (isAvc && isAac) {
+    outputFormat = new Mp4OutputFormat();
+    ext = 'mp4';
+  } else if (isAv1 && isAac) {
+    outputFormat = new Mp4OutputFormat();
+    ext = 'mp4';
+  } else if ((isVp || isAv1) && (isOpus || isVorbis)) {
+    // Нативная пара для WebM — без транскодинга
+    outputFormat = new WebMOutputFormat();
+    ext = 'webm';
+  } else if (isVp || isAv1 || isOpus) {
+    outputFormat = new WebMOutputFormat();
+    ext = 'webm';
+  } else {
+    outputFormat = new Mp4OutputFormat();
+    ext = 'mp4';
+  }
 
-      const output = new Output({ format: outputFormat, target: new BufferTarget() });
+  const videoBlob = new Blob([videoBuf]);
+  const audioBlob = new Blob([audioBuf]);
 
-      const videoConversion = await Conversion.init({
-        input: videoInput, output, composable: true, audio: { discard: true },
-      });
-      const audioConversion = await Conversion.init({
-        input: audioInput, output, composable: true, video: { discard: true },
-      });
+  const videoInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(videoBlob) });
+  const audioInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(audioBlob) });
 
-      if (!videoConversion.isValid || !audioConversion.isValid) {
-        throw new Error('Конверсия невозможна (несовместимый кодек с контейнером)');
-      }
+  const output = new Output({ format: outputFormat, target: new BufferTarget() });
 
-      let vp = 0, ap = 0;
-      videoConversion.onProgress = (p) => { vp = p; if (onProgress) onProgress((vp + ap) / 2); };
-      audioConversion.onProgress = (p) => { ap = p; if (onProgress) onProgress((vp + ap) / 2); };
+  const videoConversion = await Conversion.init({
+    input: videoInput, output, composable: true, audio: { discard: true },
+  });
+  const audioConversion = await Conversion.init({
+    input: audioInput, output, composable: true, video: { discard: true },
+  });
 
-      await output.start();
-      await Promise.all([videoConversion.execute(), audioConversion.execute()]);
-      await output.finalize();
+  if (!videoConversion.isValid || !audioConversion.isValid) {
+    throw new Error('Конверсия невозможна (несовместимый кодек с контейнером)');
+  }
 
-      const blob = new Blob([output.target.buffer], { type: outputFormat.mimeType });
-      return { blob, ext };
-    }
+  let vp = 0, ap = 0;
+  videoConversion.onProgress = (p) => { vp = p; if (onProgress) onProgress((vp + ap) / 2); };
+  audioConversion.onProgress = (p) => { ap = p; if (onProgress) onProgress((vp + ap) / 2); };
+
+  await output.start();
+  await Promise.all([videoConversion.execute(), audioConversion.execute()]);
+  await output.finalize();
+
+  const blob = new Blob([output.target.buffer], { type: outputFormat.mimeType });
+  return { blob, ext };
+}
 
     async function muxAudioOnly(audioBuf, audioMime, onProgress) {
       const audioCodec = codecOf(audioMime);
@@ -1257,7 +1324,19 @@
     function hideModal() {
       if (modalEl) modalEl.style.display = 'none';
     }
-
+    function showModal() {
+        if (!modalEl) return;
+        modalEl.style.display = '';
+        const box = modalEl.querySelector('#ytdl-modal-box');
+        if (box) {
+            if (box.classList.contains('ytdl-minimized')) {
+                box.classList.remove('ytdl-minimized');
+                modalEl.classList.remove('ytdl-minimized');
+            }
+            void box.offsetHeight; // force reflow — чтобы offsetHeight был корректен
+            positionModalExpanded();
+        }
+    }
     function updatePauseButtonLabel() {
       if (!modalEl || !activeDownloadController) return;
       const btn = modalEl.querySelector('.ytdl-modal-pause');
@@ -1544,7 +1623,10 @@
       });
       activeSabrStream = sabrStream;
       attachSabrDiagnostics(sabrStream);
-      controller.registerAbort(() => { try { sabrStream.abort(); } catch (e) {} });
+      controller.registerAbort(() => {
+          if (!controller.cancelled) return;
+          try { sabrStream.abort(); } catch (e) {}
+      });
 
       const { videoStream, audioStream, selectedFormats } = await sabrStream.start({
         videoFormat: videoFmt.itag,
@@ -1592,7 +1674,10 @@
       });
       activeSabrStream = sabrStream;
       attachSabrDiagnostics(sabrStream);
-      controller.registerAbort(() => { try { sabrStream.abort(); } catch (e) {} });
+      controller.registerAbort(() => {
+          if (!controller.cancelled) return;
+          try { sabrStream.abort(); } catch (e) {}
+      });
 
       const { audioStream, selectedFormats } = await sabrStream.start({
         audioFormat: audioFmt.xtags || audioFmt.audioTrackId ? audioFmt : audioFmt.itag,
@@ -1702,7 +1787,8 @@
           return;
         }
         console.error('[ytdl]', e);
-        setModalStatus('Ошибка: ' + e.message + '\n(Перезагрузите страницу)');
+          setModalStatus('Ошибка: ' + e.message + '\n(Перезагрузите страницу)');
+          showModal();
       }
     }
 
@@ -1760,7 +1846,8 @@
           return;
         }
         console.error('[ytdl]', e);
-        setModalStatus('Ошибка: ' + e.message + '\n(Перезагрузите страницу)');
+          setModalStatus('Ошибка: ' + e.message + '\n(Перезагрузите страницу)');
+          showModal();
       }
     }
 
@@ -1940,23 +2027,23 @@
 
     let thanksHideLogged = false;
     function hideThanksButton() {
-      const container = document.querySelector('ytd-menu-renderer') || document;
-
-      const candidates = container.querySelectorAll('button, a, [role="button"]');
-      for (const el of candidates) {
-        const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
-        if (/спасибо|thanks/i.test(label)) {
-          const host =
-            el.closest('yt-button-view-model, ytd-button-renderer, ytd-badge-supported-renderer') || el;
-          if (host.isConnected) {
-            host.remove();
-            if (!thanksHideLogged) {
-              thanksHideLogged = true;
-              console.log('[ytdl] Удалена из DOM кнопку "Спасибо" — освобождено место, чтобы "Скачать" не уходила в "..."', host);
+        const container = document.querySelector('ytd-menu-renderer');
+        if (!container) return;
+        const buttons = container.querySelectorAll('button[aria-label]');
+        for (const btn of buttons) {
+            const label = (btn.getAttribute('aria-label') || '').trim();
+            if (!label) continue;
+            if (/^(спасибо|thanks)(\s|$)/i.test(label)) {
+      const host = btn.closest('yt-button-view-model, ytd-button-renderer') || btn;
+                if (host.isConnected) {
+                    host.remove();
+                    if (!thanksHideLogged) {
+                        thanksHideLogged = true;
+                        console.log('[ytdl] Удалена кнопка "Спасибо"', host);
+                    }
+                }
             }
-          }
         }
-      }
     }
 
     let nativeDownloadHideLogged = false;
@@ -2085,8 +2172,17 @@
       return fetchTvHtml5Formats(videoId);
     }
 
+    let scanTimeout = null;
+    function scheduleScan() {
+      if (scanTimeout) return;
+      scanTimeout = setTimeout(() => {
+        scanTimeout = null;
+        scanForButton();
+      }, 60);
+    }
+
     new MutationObserver(() => {
-      scanForButton();
+      scheduleScan();
       const vid = getCurrentVideoId();
       if (vid !== lastVideoId) {
         lastVideoId = vid;
@@ -2104,6 +2200,7 @@
       }
     }).observe(document.body, { childList: true, subtree: true });
 
+    // ⬇⬇⬇ БЕЗ ЭТИХ ДВУХ ВЫЗОВОВ КНОПКА НЕ ПОЯВИТСЯ ⬇⬇⬇
     scanForButton();
 
     if (lastVideoId) {
